@@ -58,6 +58,7 @@
         ;; Remote terminal access
         tmux
         mosh
+        fzf
 
         ;; Browsers
         (specification->package "qtwayland@5")

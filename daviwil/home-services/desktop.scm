@@ -10,7 +10,7 @@
 (use-package-modules admin compression curl fonts freedesktop gimp glib gnome gnome-xyz
                      gstreamer image-viewers kde-frameworks linux lsof music package-management
                      password-utils pdf pulseaudio shellutils ssh syncthing terminals tmux
-                     video web-browsers wget wm xdisorg xorg)
+                     video vim web-browsers wget wm xdisorg xorg)
 
 (define (home-desktop-profile-service config)
   (list sway
@@ -91,6 +91,9 @@
 
         ;; File syncing
         syncthing-gtk
+
+        ;; Terminal editor
+        neovim
 
         ;; General utilities
         curl

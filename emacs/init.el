@@ -391,6 +391,15 @@ Opening and closing delimiters will have matching colors."
         ("Asia/Shanghai" "Shanghai")
         ("Asia/Kolkata" "Hyderabad")))
 
+(when (daemonp)
+  (add-hook 'server-after-make-frame-hook
+            (lambda ()
+              (dolist (f (frame-list))
+                (unless (or (frame-visible-p f)
+                            (frame-parameter f 'tty-type)
+                            (frame-parameter f 'client))
+                  (delete-frame f t))))))
+
 ;; ----- Special Buffers as Popup Window -----
 
 (setq display-buffer-alist

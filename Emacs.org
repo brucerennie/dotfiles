@@ -548,6 +548,23 @@ I find it easier to just run the main Emacs instance as a daemon using =server-s
 
 #+end_src
 
+When Emacs runs as a =--daemon=, it creates an invisible bookkeeping frame (often shown as =F1= with no TTY).  That hidden frame keeps claiming minibuffer ownership, so when an =emacsclient -t= frame attaches and I hit =M-x=, the minibuffer can end up on the hidden frame while my keystrokes go to the TTY frame — classic "stuck M-x" symptom where letters all register as "undefined" and =C-g= won't break out.
+
+The fix is to delete the daemon's hidden frames whenever a real client attaches, leaving only visible / TTY frames.
+
+#+begin_src emacs-lisp :tangle emacs/init.el
+
+  (when (daemonp)
+    (add-hook 'server-after-make-frame-hook
+              (lambda ()
+                (dolist (f (frame-list))
+                  (unless (or (frame-visible-p f)
+                              (frame-parameter f 'tty-type)
+                              (frame-parameter f 'client))
+                    (delete-frame f t))))))
+
+#+end_src
+
 ** Send Special Buffers to a Popup Window
 
 Here's another minimal implementation of a package I commonly use called [[https://github.com/karthink/popper][popper.el]].  The goal here is to automatically place a specific set of buffers into a popup window at the bottom of the frame and make that window togglable with a key binding.

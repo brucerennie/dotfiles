@@ -394,11 +394,20 @@ Opening and closing delimiters will have matching colors."
 (when (daemonp)
   (add-hook 'server-after-make-frame-hook
             (lambda ()
-              (dolist (f (frame-list))
-                (unless (or (frame-visible-p f)
-                            (frame-parameter f 'tty-type)
-                            (frame-parameter f 'client))
-                  (delete-frame f t))))))
+              ;; Defensive: the newly-created client frame is (selected-frame)
+              ;; when this hook fires.  NEVER delete it, even if its parameters
+              ;; look unexpected during a transient state.
+              (let ((just-made (selected-frame)))
+                (dolist (f (frame-list))
+                  (unless (or (eq f just-made)
+                              (frame-visible-p f)
+                              (frame-parameter f 'tty-type)
+                              (frame-parameter f 'client))
+                    (condition-case err
+                        (delete-frame f t)
+                      (error
+                       (message "daemon-frame cleanup: failed to delete %s: %s"
+                                (frame-parameter f 'name) err)))))))))
 
 ;; ----- Special Buffers as Popup Window -----
 

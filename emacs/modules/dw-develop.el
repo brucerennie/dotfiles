@@ -40,7 +40,11 @@
   :demand t
   :load-path "/home/daviwil/Projects/Code/sigil/sigil/editor/emacs"
   :custom
-  (sigil-repl-program "/home/daviwil/.sigil/bin/sigil"))
+  ;; sigil-program (defcustom in sigil.el) = the binary M-x run-sigil spawns.
+  ;; Point it at the Phase-4.1 dev build (0.17.9-dev+33a1a7ca) so same-module
+  ;; live redefinition works. Revert to the default "sigil" after a 0.17.10+
+  ;; release ships Phase 4.1.
+  (sigil-program "/home/daviwil/Projects/Code/sigil/sigil/build/dev/bin/sigil"))
 
 (use-package js-mode
   :ensure nil

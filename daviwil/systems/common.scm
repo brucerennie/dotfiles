@@ -28,7 +28,13 @@
                      ("EDITOR" . "emacsclient")
 
                      ;; Add some things to $PATH (maybe integrate into other services?)
-                     ("PATH" . "$HOME/.bin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH")
+                     ("PATH" . "$HOME/.sigil/bin:$HOME/.bin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH")
+
+                     ;; Route GPG pinentry to the current terminal
+                     ("GPG_TTY" . "$(tty)")
+
+                     ;; sudo askpass via tmux popup (use sudo -A)
+                     ("SUDO_ASKPASS" . "$HOME/.local/bin/sudo-askpass-tmux")
 
                      ;; Make sure Flatpak apps are visible
                      ("XDG_DATA_DIRS" . "$XDG_DATA_DIRS:$HOME/.local/share/flatpak/exports/share")
@@ -60,22 +66,37 @@
                               "fi\n"))
                 ,(plain-file "bash-sway-login"
                              (string-append
-                              "if [ -z \"$WAYLAND_DISPLAY\" ] && [ \"$XDG_VTNR\" -eq 1 ]; then\n"
+                              "if [ -z \"$WAYLAND_DISPLAY\" ] && [ \"${XDG_VTNR:-0}\" -eq 1 ]; then\n"
                               "  exec sway\n"
                               "fi\n"))))
              (bashrc
-              `(,(local-file "../files/bash-prompt")))))
+              `(,(local-file "../files/bash-prompt")
+                ,(plain-file "gpg-tty-update"
+                             (string-append
+                              ;; Tell gpg-agent the current tty for pinentry routing\n"
+                              "gpg-connect-agent updatestartuptty /bye >/dev/null 2>&1\n"))))))
 
    ;; Place other files
    (simple-service 'profile-files-service
                    home-files-service-type
-                   (list `(".inputrc" ,(local-file "../files/inputrc"))))
+                   (list `(".inputrc" ,(local-file "../files/inputrc"))
+                         `(".local/bin/sudo-askpass-tmux"
+                           ,(computed-file "sudo-askpass-tmux"
+                              #~(begin
+                                  (copy-file #$(local-file "../files/sudo-askpass-tmux")
+                                             #$output)
+                                  (chmod #$output #o755))))))
 
-   ;; GnuPG configuration
+   ;; GnuPG configuration — use pinentry-tmux for passphrase prompts
+   ;; in tmux sessions, with pinentry-curses as a fallback
    (service home-gpg-agent-service-type
             (home-gpg-agent-configuration
              (pinentry-program
-              (file-append pinentry-emacs "/bin/pinentry-emacs"))
+              (computed-file "pinentry-tmux"
+                #~(begin
+                    (copy-file #$(local-file "../files/pinentry-tmux")
+                               #$output)
+                    (chmod #$output #o755))))
              (ssh-support? #t)
              (default-cache-ttl 28800)
              (max-cache-ttl 28800)
@@ -98,10 +119,7 @@
               (list
                #~(job
                   '(next-hour (range 0 24 4))
-                  "~/.dotfiles/.bin/sync-passwords")
-               #~(job
-                  "0,30 8-17 * * 1-5"
-                  "~/Tracker/chief-ping")))))
+                  "~/.dotfiles/.bin/sync-passwords")))))
 
    ;; File synchronization
    (service home-syncthing-service-type)

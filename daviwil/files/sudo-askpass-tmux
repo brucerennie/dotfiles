@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# sudo-askpass-tmux — sudo askpass helper that prompts via tmux display-popup
+#
+# Usage: Set SUDO_ASKPASS to this script's path, then use sudo -A.
+# sudo passes the prompt string (e.g., "[sudo] password for user:") as $1.
+# The script also inspects the parent process to show what command triggered sudo.
+
+set -euo pipefail
+
+PROMPT="${1:-Password:}"
+
+# --- Detect tmux ---
+TMUX_SOCKET=""
+for sock in "/tmp/tmux-$(id -u)/default" "/tmp/tmux-$(id -u)/"*; do
+    if [ -S "$sock" ] 2>/dev/null; then
+        TMUX_SOCKET="$sock"
+        break
+    fi
+done
+
+# Without tmux, fall back to terminal read
+if [ -z "$TMUX_SOCKET" ] || ! tmux -S "$TMUX_SOCKET" list-sessions &>/dev/null; then
+    # Direct terminal fallback
+    if [ -t 0 ]; then
+        printf '%s ' "$PROMPT" >&2
+        stty -echo 2>/dev/null
+        IFS= read -r pass
+        stty echo 2>/dev/null
+        echo "" >&2
+        printf '%s' "$pass"
+        exit 0
+    else
+        echo "sudo-askpass-tmux: no tmux and no terminal available" >&2
+        exit 1
+    fi
+fi
+
+# --- Resolve tmux target ---
+# Find the most recently active client's session
+TMUX_TARGET=""
+active_session=$(tmux -S "$TMUX_SOCKET" list-clients -F '#{client_activity} #{client_session}' 2>/dev/null \
+    | sort -rn | head -1 | awk '{print $2}')
+if [ -n "$active_session" ]; then
+    TMUX_TARGET="-t $active_session"
+fi
+
+# --- Extract the sudo command for context ---
+sudo_command=""
+if [ -n "$PPID" ] && [ -f "/proc/$PPID/cmdline" ]; then
+    # /proc/PPID/cmdline has null-separated args: sudo -A command arg1 arg2...
+    # Skip "sudo" and any flags to show just the command being elevated
+    raw_args=$(tr '\0' '\n' < "/proc/$PPID/cmdline")
+    # Collect everything after the sudo binary and its flags
+    in_flags=true
+    while IFS= read -r arg; do
+        if $in_flags; then
+            case "$arg" in
+                sudo|*/sudo)
+                    continue ;;
+                -*)
+                    continue ;;
+                *)
+                    in_flags=false
+                    sudo_command="$arg"
+                    ;;
+            esac
+        else
+            sudo_command="$sudo_command $arg"
+        fi
+    done <<< "$raw_args"
+fi
+
+# --- Prompt via tmux popup ---
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/sudo-askpass-tmux.XXXXXX")
+chmod 700 "$tmpdir"
+
+passfile="$tmpdir/pass"
+statusfile="$tmpdir/status"
+echo "cancel" > "$statusfile"
+
+# Create the popup script
+cat > "$tmpdir/popup.sh" <<'POPUP_EOF'
+#!/usr/bin/env bash
+PASSFILE="$1"
+STATUSFILE="$2"
+PROMPT_TEXT="$3"
+SUDO_CMD="$4"
+
+cleanup() { stty echo 2>/dev/null; }
+trap cleanup EXIT
+
+echo ""
+if [ -n "$SUDO_CMD" ]; then
+    printf '\033[38;5;240mCommand:\033[0m \033[1m%s\033[0m\n\n' "$SUDO_CMD"
+fi
+
+stty -echo 2>/dev/null
+printf '%s ' "$PROMPT_TEXT"
+IFS= read -r passphrase
+stty echo 2>/dev/null
+echo ""
+
+if [ -n "$passphrase" ]; then
+    printf '%s' "$passphrase" > "$PASSFILE"
+    echo "ok" > "$STATUSFILE"
+else
+    echo "cancel" > "$STATUSFILE"
+fi
+POPUP_EOF
+chmod 700 "$tmpdir/popup.sh"
+
+# Calculate popup size
+term_width=$(tmux -S "$TMUX_SOCKET" display-message $TMUX_TARGET -p '#{window_width}' 2>/dev/null || echo 80)
+popup_width=70
+popup_height=8
+if [ -n "$sudo_command" ]; then
+    popup_height=10
+fi
+if [ "$popup_width" -gt "$((term_width - 4))" ]; then
+    popup_width=$((term_width - 4))
+fi
+if [ "$popup_width" -lt 40 ]; then
+    popup_width=40
+fi
+
+# Launch popup
+# shellcheck disable=SC2086
+tmux -S "$TMUX_SOCKET" display-popup \
+    $TMUX_TARGET \
+    -E \
+    -T " sudo " \
+    -w "$popup_width" \
+    -h "$popup_height" \
+    -- "$tmpdir/popup.sh" \
+        "$passfile" \
+        "$statusfile" \
+        "$PROMPT" \
+        "$sudo_command"
+
+status=$(cat "$statusfile" 2>/dev/null || echo "cancel")
+
+if [ "$status" = "ok" ] && [ -f "$passfile" ]; then
+    cat "$passfile"
+    # Secure cleanup
+    dd if=/dev/urandom of="$passfile" bs=256 count=1 2>/dev/null
+    rm -rf "$tmpdir"
+    exit 0
+else
+    rm -rf "$tmpdir"
+    exit 1
+fi

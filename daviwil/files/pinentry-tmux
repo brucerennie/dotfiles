@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# pinentry-tmux — GPG pinentry that prompts via tmux display-popup
+#
+# Implements a minimal Assuan-protocol pinentry that, when a passphrase
+# is needed, opens a tmux popup to collect it. Falls back to pinentry-curses
+# if no tmux server is reachable.
+#
+# gpg-agent launches pinentry without the calling shell's environment,
+# so we detect tmux by checking for the server socket directly and
+# use the OPTION ttyname from the Assuan protocol to find the right
+# tmux pane to target.
+
+set -euo pipefail
+
+FALLBACK_PINENTRY="pinentry-curses"
+DESC=""
+PROMPT="Passphrase:"
+TITLE=""
+ERROR_MSG=""
+KEYINFO=""
+OPTION_TTY=""
+TMUX_TARGET=""
+
+# Detect tmux server — gpg-agent doesn't pass $TMUX to pinentry,
+# so we check for the socket directly
+TMUX_SOCKET=""
+for sock in "/tmp/tmux-$(id -u)/default" "/tmp/tmux-$(id -u)/"*; do
+    if [ -S "$sock" ] 2>/dev/null; then
+        TMUX_SOCKET="$sock"
+        break
+    fi
+done
+
+if [ -z "$TMUX_SOCKET" ]; then
+    exec "$FALLBACK_PINENTRY" "$@"
+fi
+
+# Verify the tmux server is actually running
+if ! tmux -S "$TMUX_SOCKET" list-sessions &>/dev/null; then
+    exec "$FALLBACK_PINENTRY" "$@"
+fi
+
+# Find the tmux pane matching a given tty, returns session:window.pane
+find_pane_by_tty() {
+    local target_tty="$1"
+    tmux -S "$TMUX_SOCKET" list-panes -a -F '#{pane_tty} #{session_name}:#{window_index}.#{pane_index}' 2>/dev/null \
+        | while read -r pane_tty pane_target; do
+            if [ "$pane_tty" = "$target_tty" ]; then
+                echo "$pane_target"
+                return
+            fi
+        done
+}
+
+# Find the most recently active tmux client
+find_active_client() {
+    tmux -S "$TMUX_SOCKET" list-clients -F '#{client_activity} #{client_session}' 2>/dev/null \
+        | sort -rn | head -1 | awk '{print $2}'
+}
+
+# URL-decode %XX sequences used in Assuan protocol
+url_decode() {
+    local data="$1"
+    printf '%b' "$(echo "$data" | sed 's/+/ /g; s/%\([0-9A-Fa-f][0-9A-Fa-f]\)/\\x\1/g')"
+}
+
+# Strip basic HTML-like tags from pinentry descriptions
+strip_tags() {
+    echo "$1" | sed 's/<[^>]*>//g'
+}
+
+# Resolve tmux target — prefer the pane matching OPTION ttyname,
+# fall back to the most recently active client's session
+resolve_target() {
+    if [ -n "$OPTION_TTY" ]; then
+        local pane
+        pane=$(find_pane_by_tty "$OPTION_TTY")
+        if [ -n "$pane" ]; then
+            TMUX_TARGET="-t $pane"
+            return
+        fi
+    fi
+
+    local session
+    session=$(find_active_client)
+    if [ -n "$session" ]; then
+        TMUX_TARGET="-t $session"
+    else
+        TMUX_TARGET=""
+    fi
+}
+
+# Prompt for passphrase via tmux display-popup
+get_passphrase() {
+    resolve_target
+
+    local tmpdir
+    tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/pinentry-tmux.XXXXXX")
+    chmod 700 "$tmpdir"
+
+    local passfile="$tmpdir/pass"
+    local statusfile="$tmpdir/status"
+    echo "cancel" > "$statusfile"
+
+    # Build the display text
+    local display_desc
+    display_desc=$(strip_tags "$(url_decode "$DESC")")
+    local display_prompt
+    display_prompt=$(url_decode "$PROMPT")
+    local display_error=""
+    if [ -n "$ERROR_MSG" ]; then
+        display_error=$(strip_tags "$(url_decode "$ERROR_MSG")")
+    fi
+
+    # Create the popup script — collects passphrase and writes to file
+    local popup_script="$tmpdir/popup.sh"
+    cat > "$popup_script" <<'POPUP_EOF'
+#!/usr/bin/env bash
+PASSFILE="$1"
+STATUSFILE="$2"
+DISPLAY_DESC="$3"
+DISPLAY_PROMPT="$4"
+DISPLAY_ERROR="$5"
+
+cleanup() {
+    stty echo 2>/dev/null
+}
+trap cleanup EXIT
+
+echo ""
+if [ -n "$DISPLAY_ERROR" ]; then
+    printf '\033[1;31m%s\033[0m\n\n' "$DISPLAY_ERROR"
+fi
+if [ -n "$DISPLAY_DESC" ]; then
+    echo "$DISPLAY_DESC"
+    echo ""
+fi
+
+stty -echo 2>/dev/null
+printf '%s ' "$DISPLAY_PROMPT"
+IFS= read -r passphrase
+stty echo 2>/dev/null
+echo ""
+
+if [ -n "$passphrase" ]; then
+    printf '%s' "$passphrase" > "$PASSFILE"
+    echo "ok" > "$STATUSFILE"
+else
+    echo "cancel" > "$STATUSFILE"
+fi
+POPUP_EOF
+    chmod 700 "$popup_script"
+
+    # Calculate popup dimensions — query the target's window width
+    local term_width
+    if [ -n "$TMUX_TARGET" ]; then
+        term_width=$(tmux -S "$TMUX_SOCKET" display-message $TMUX_TARGET -p '#{window_width}' 2>/dev/null || echo 80)
+    else
+        term_width=$(tmux -S "$TMUX_SOCKET" display-message -p '#{window_width}' 2>/dev/null || echo 80)
+    fi
+    local popup_height=10
+    local popup_width=70
+    if [ "$popup_width" -gt "$((term_width - 4))" ]; then
+        popup_width=$((term_width - 4))
+    fi
+    if [ "$popup_width" -lt 40 ]; then
+        popup_width=40
+    fi
+
+    # Launch tmux popup — this blocks until the popup closes
+    # shellcheck disable=SC2086
+    tmux -S "$TMUX_SOCKET" display-popup \
+        $TMUX_TARGET \
+        -E \
+        -T " GPG Passphrase " \
+        -w "$popup_width" \
+        -h "$popup_height" \
+        -- "$popup_script" \
+            "$passfile" \
+            "$statusfile" \
+            "$display_desc" \
+            "$display_prompt" \
+            "$display_error"
+
+    local status
+    status=$(cat "$statusfile" 2>/dev/null || echo "cancel")
+
+    if [ "$status" = "ok" ] && [ -f "$passfile" ]; then
+        local passphrase
+        passphrase=$(cat "$passfile")
+        echo "D $passphrase"
+        echo "OK"
+    else
+        echo "ERR 83886179 Operation cancelled <Pinentry>"
+    fi
+
+    # Secure cleanup — overwrite passphrase file before removing
+    if [ -f "$passfile" ]; then
+        dd if=/dev/urandom of="$passfile" bs=256 count=1 2>/dev/null
+    fi
+    rm -rf "$tmpdir"
+}
+
+# Main Assuan protocol loop
+echo "OK Pleased to meet you"
+
+while IFS= read -r line; do
+    # Strip trailing CR if present
+    line="${line%$'\r'}"
+
+    # Parse command and argument
+    cmd="${line%% *}"
+    if [[ "$line" == *" "* ]]; then
+        arg="${line#* }"
+    else
+        arg=""
+    fi
+
+    case "$cmd" in
+        OPTION)
+            # Capture ttyname for targeting the right tmux pane
+            case "$arg" in
+                ttyname=*)
+                    OPTION_TTY="${arg#ttyname=}"
+                    ;;
+            esac
+            echo "OK"
+            ;;
+        SETDESC)
+            DESC="$arg"
+            echo "OK"
+            ;;
+        SETPROMPT)
+            PROMPT="$arg"
+            echo "OK"
+            ;;
+        SETTITLE)
+            TITLE="$arg"
+            echo "OK"
+            ;;
+        SETERROR)
+            ERROR_MSG="$arg"
+            echo "OK"
+            ;;
+        SETOK|SETCANCEL|SETNOTOK|SETQUALITYBAR|SETQUALITYBAR_TT)
+            echo "OK"
+            ;;
+        SETKEYINFO)
+            KEYINFO="$arg"
+            echo "OK"
+            ;;
+        GETPIN)
+            get_passphrase
+            # Clear error after use
+            ERROR_MSG=""
+            ;;
+        CONFIRM)
+            echo "OK"
+            ;;
+        MESSAGE)
+            echo "OK"
+            ;;
+        GETINFO)
+            case "$arg" in
+                flavor)
+                    echo "D pinentry-tmux"
+                    echo "OK"
+                    ;;
+                version)
+                    echo "D 0.1.0"
+                    echo "OK"
+                    ;;
+                ttyinfo)
+                    echo "D - - -"
+                    echo "OK"
+                    ;;
+                pid)
+                    echo "D $$"
+                    echo "OK"
+                    ;;
+                *)
+                    echo "OK"
+                    ;;
+            esac
+            ;;
+        BYE)
+            echo "OK closing connection"
+            exit 0
+            ;;
+        RESET)
+            DESC=""
+            PROMPT="Passphrase:"
+            ERROR_MSG=""
+            KEYINFO=""
+            echo "OK"
+            ;;
+        NOP)
+            echo "OK"
+            ;;
+        "#"*)
+            # Comment, ignore
+            ;;
+        "")
+            # Empty line, ignore
+            ;;
+        *)
+            echo "OK"
+            ;;
+    esac
+done

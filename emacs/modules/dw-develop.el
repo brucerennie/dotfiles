@@ -38,9 +38,9 @@
 (use-package sigil
   :ensure nil
   :demand t
-  :load-path "/home/daviwil/Projects/Code/sigil-worktrees/sigil-emacs/editor/emacs"
+  :load-path "/home/daviwil/Projects/Code/sigil/sigil/editor/emacs"
   :custom
-  (sigil-repl-program "/home/daviwil/Projects/Code/sigil-worktrees/sigil-emacs/build/bin/sigil"))
+  (sigil-repl-program "/home/daviwil/.sigil/bin/sigil"))
 
 (use-package js-mode
   :ensure nil
